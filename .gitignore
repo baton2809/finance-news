@@ -12,7 +12,6 @@ venv/
 
 # Data & cache files
 *.pkl
-*.csv
 *.xlsx
 *.tsv
 *.txt
