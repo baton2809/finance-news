@@ -1,0 +1,4 @@
+finance-news/embeddings_cache_doc.pkl
+finance-news/embeddings_cache_chunks.pkl
+.env.example
+question.txt
