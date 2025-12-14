@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    image: finance-rag
+    volumes:
+      - .:/app
+      # This volume persists the cache so you don't re-embed every time
+      - ./cache:/app/cache
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY}
+      # Use python unbuffered to see logs immediately
+      - PYTHONUNBUFFERED=1
+    # Example command (can be overridden)
+    command: python main.py --mode v3 --limit 10

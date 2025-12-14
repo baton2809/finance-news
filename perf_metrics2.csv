@@ -1,0 +1,2 @@
+timestamp,mode,questions_processed,elapsed_sec,sec_per_question,retrieval_top_k,final_k,embedding_calls,embedding_tokens,embedding_cost_usd,llm_calls,llm_prompt_tokens,llm_cost_usd,total_cost_usd
+2025-12-14 21:42:20,v2,30,249.94,8.33,5,3,30,546,0.0,30,50414,0.005041,0.005041
