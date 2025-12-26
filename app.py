@@ -10,7 +10,7 @@ sys.path.append('.')
 
 # Настройки страницы
 st.set_page_config(
-    page_title="Финансовый RAG Чат",
+    page_title="AI Финансовый консультант",
     page_icon="💰",
     layout="wide"
 )
@@ -182,4 +182,5 @@ with st.container():
                             "content": f"Произошла ошибка: {error_msg}",
                             "timestamp": datetime.now().isoformat(),
                             "error": True
+
                         })
