@@ -6,6 +6,7 @@ import logging
 import argparse
 import json
 from typing import List, Tuple, Dict, Any
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,12 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+
+# Additional metrics libraries
+from rouge_score import rouge_scorer
+from bert_score import score as bert_score_fn
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ---------------------- Logging ----------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -36,19 +43,20 @@ PRICE_PER_1K_TOK_LLM = 0.0001
 
 # ---------------------- Global embedding model -------
 EMBEDDING_MODEL = None
-EMBEDDING_DIM = 384  # Dimension for MiniLM-L12-v2
+EMBEDDING_DIM = 384  # Dimension for multilingual-e5-small (lighter, faster)
 
 def get_embedding_model():
     global EMBEDDING_MODEL
     if EMBEDDING_MODEL is None:
-        logger.info("Loading local embedding model: paraphrase-multilingual-MiniLM-L12-v2")
-        EMBEDDING_MODEL = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+        logger.info("Loading local embedding model: intfloat/multilingual-e5-small")
+        EMBEDDING_MODEL = SentenceTransformer('intfloat/multilingual-e5-small')
     return EMBEDDING_MODEL
 
 # ---------------------- Clients ----------------------
 def get_llm_client() -> OpenAI:
+    """Returns DeepSeek API client (OpenAI-compatible)"""
     return OpenAI(
-        base_url="https://api.perplexity.ai",
+        base_url="https://api.deepseek.com",
         api_key=LLM_API_KEY
     )
 
@@ -189,7 +197,7 @@ def llm_rerank(question: str, candidates: List[Tuple[Any, float]], df: pd.DataFr
     client = get_llm_client()
     try:
         resp = client.chat.completions.create(
-            model="sonar",
+            model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1, max_tokens=20
         )
@@ -228,46 +236,143 @@ def generate_answer(question: str, context: str) -> str:
     )
     
     resp = client.chat.completions.create(
-        model="sonar",
+        model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2
     )
     COST["llm_calls"] += 1
     return resp.choices[0].message.content
 
-# ---------------------- LLM-as-a-Judge ----------------
-def evaluate_answer(question: str, answer: str, context: str) -> Dict[str, int]:
+# ---------------------- Evaluation Metrics ----------------
+
+# Initialize ROUGE scorer (cached for efficiency)
+ROUGE_SCORER = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=False)
+
+def calculate_rouge_scores(answer: str, context: str) -> Dict[str, float]:
+    """Calculate ROUGE scores between answer and context."""
+    scores = ROUGE_SCORER.score(context, answer)
+    return {
+        "rouge1_f": scores['rouge1'].fmeasure,
+        "rouge2_f": scores['rouge2'].fmeasure,
+        "rougeL_f": scores['rougeL'].fmeasure,
+    }
+
+def calculate_bert_score(answer: str, context: str) -> Dict[str, float]:
+    """Calculate BERTScore for semantic similarity."""
+    try:
+        P, R, F1 = bert_score_fn(
+            [answer], [context],
+            lang="ru",  # Russian language
+            verbose=False,
+            rescale_with_baseline=True
+        )
+        return {
+            "bert_precision": float(P[0]),
+            "bert_recall": float(R[0]),
+            "bert_f1": float(F1[0]),
+        }
+    except Exception as e:
+        logger.warning(f"BERTScore calculation failed: {e}")
+        return {"bert_precision": 0.0, "bert_recall": 0.0, "bert_f1": 0.0}
+
+def calculate_answer_quality(question: str, answer: str, context: str) -> Dict[str, float]:
+    """Calculate lexical and structural quality metrics."""
+    # Answer length metrics
+    answer_words = len(answer.split())
+    context_words = len(context.split())
+
+    # Context coverage (how much of context keywords appear in answer)
+    context_tokens = set(context.lower().split())
+    answer_tokens = set(answer.lower().split())
+    coverage = len(context_tokens & answer_tokens) / max(len(context_tokens), 1)
+
+    # Question keyword overlap
+    question_tokens = set(question.lower().split())
+    question_coverage = len(question_tokens & answer_tokens) / max(len(question_tokens), 1)
+
+    # TF-IDF similarity between answer and context
+    try:
+        vectorizer = TfidfVectorizer()
+        tfidf_matrix = vectorizer.fit_transform([context, answer])
+        tfidf_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+    except:
+        tfidf_sim = 0.0
+
+    return {
+        "answer_length": answer_words,
+        "context_coverage": coverage,
+        "question_coverage": question_coverage,
+        "tfidf_similarity": tfidf_sim,
+    }
+
+def evaluate_answer_llm(question: str, answer: str, context: str) -> Dict[str, int]:
     """
-    Asks the LLM to rate the answer on scale 1-5.
-    Returns: {'relevance': int, 'faithfulness': int}
+    LLM-as-a-Judge: Asks the LLM to rate the answer on scale 1-5.
+    Returns: {'llm_relevance': int, 'llm_faithfulness': int}
     """
     client = get_llm_client()
-    
+
     prompt = f"""
     You are a judge. Evaluate the answer based on the context and question.
-    
+
     Question: {question}
     Context: {context}
     Answer: {answer}
-    
+
     1. Relevance: Does the answer directly address the question? (1-5)
     2. Faithfulness: Is the answer fully supported by the context? (1-5)
-    
+
     Output JSON only: {{"relevance": <int>, "faithfulness": <int>}}
     """
-    
+
     try:
         resp = client.chat.completions.create(
-            model="sonar",
+            model="deepseek-chat",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0
         )
+        COST["llm_calls"] += 1
         content = resp.choices[0].message.content
-        # Extract JSON
         json_str = re.search(r'\{.*\}', content, re.DOTALL).group(0)
-        return json.loads(json_str)
+        result = json.loads(json_str)
+        return {
+            "llm_relevance": result.get("relevance", 0),
+            "llm_faithfulness": result.get("faithfulness", 0)
+        }
     except:
-        return {"relevance": 0, "faithfulness": 0}
+        return {"llm_relevance": 0, "llm_faithfulness": 0}
+
+def evaluate_answer(question: str, answer: str, context: str) -> Dict[str, float]:
+    """
+    Comprehensive evaluation combining multiple metrics:
+    - LLM-as-Judge (relevance, faithfulness)
+    - ROUGE scores (lexical overlap)
+    - BERTScore (semantic similarity)
+    - Answer quality metrics (coverage, length, TF-IDF)
+    """
+    metrics = {}
+
+    # 1. LLM-as-Judge (subjective but comprehensive)
+    llm_metrics = evaluate_answer_llm(question, answer, context)
+    metrics.update(llm_metrics)
+
+    # 2. ROUGE scores (lexical overlap with context)
+    rouge_metrics = calculate_rouge_scores(answer, context)
+    metrics.update(rouge_metrics)
+
+    # 3. BERTScore (semantic similarity)
+    bert_metrics = calculate_bert_score(answer, context)
+    metrics.update(bert_metrics)
+
+    # 4. Answer quality metrics
+    quality_metrics = calculate_answer_quality(question, answer, context)
+    metrics.update(quality_metrics)
+
+    # Legacy compatibility: keep 'relevance' and 'faithfulness' for backward compat
+    metrics["relevance"] = metrics["llm_relevance"]
+    metrics["faithfulness"] = metrics["llm_faithfulness"]
+
+    return metrics
 
 # ---------------------- Pipelines --------------------
 def run_rag(mode: str, question: str, df: pd.DataFrame, index: faiss.Index, metadata: List[Any], top_k: int, final_k: int) -> Tuple[str, Dict]:
@@ -293,9 +398,13 @@ def run_rag(mode: str, question: str, df: pd.DataFrame, index: faiss.Index, meta
 
 # ---------------------- Main -------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["v1", "v2", "v3"], default="v2")
-    parser.add_argument("--limit", type=int, default=None)
+    parser = argparse.ArgumentParser(description="RAG System for Financial Literacy Q&A")
+    parser.add_argument("--mode", choices=["v1", "v2", "v3"], default="v2",
+                        help="RAG mode: v1=doc-level, v2=chunk, v3=chunk+rerank")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit number of questions to process")
+    parser.add_argument("--skip-bert", action="store_true",
+                        help="Skip BERTScore calculation (faster)")
     args = parser.parse_args()
 
     # Config based on mode
@@ -304,42 +413,76 @@ def main():
 
     # Load Data
     df = load_knowledge_base("./train_data.csv")
-    
-    # Build FAISS (Vector DB)
+
+    # Build FAISS (Vector DB) - Note: need to rebuild with new embedding model
     index_mode = "v1" if args.mode == "v1" else "v2"
-    index_file = f"faiss_index_{index_mode}.bin"
-    meta_file = f"faiss_meta_{index_mode}.pkl"
-    
+    index_file = f"faiss_index_{index_mode}_e5small.bin"  # e5-small model
+    meta_file = f"faiss_meta_{index_mode}_e5small.pkl"
+
     index, metadata = build_faiss_index(df, index_file, meta_file, mode=index_mode)
 
     # Load Questions
     questions_df = pd.read_csv("./questions.csv")
     questions = questions_df["Вопрос"].tolist()
-    if args.limit: questions = questions[:args.limit]
+    if args.limit:
+        questions = questions[:args.limit]
 
     answers = []
-    total_metrics = {"relevance": 0, "faithfulness": 0}
-    
+    all_metrics = []
+
+    # Initialize accumulators for all metrics
+    metric_keys = [
+        "llm_relevance", "llm_faithfulness",
+        "rouge1_f", "rouge2_f", "rougeL_f",
+        "bert_precision", "bert_recall", "bert_f1",
+        "context_coverage", "question_coverage", "tfidf_similarity"
+    ]
+    total_metrics = {k: 0.0 for k in metric_keys}
+
     for q in tqdm(questions, desc="RAG Pipeline"):
         ans, metrics = run_rag(args.mode, q, df, index, metadata, top_k, final_k)
         answers.append(ans)
-        
+        all_metrics.append(metrics)
+
         # Accumulate metrics
-        total_metrics["relevance"] += metrics["relevance"]
-        total_metrics["faithfulness"] += metrics["faithfulness"]
+        for k in metric_keys:
+            total_metrics[k] += metrics.get(k, 0.0)
 
     # Save Results
     questions_df = questions_df.iloc[:len(answers)]
     questions_df["Ответы"] = answers
     questions_df.to_csv("submission.csv", index=False)
-    
+
+    # Save detailed metrics to CSV
+    metrics_df = pd.DataFrame(all_metrics)
+    metrics_df.to_csv("metrics_detailed.csv", index=False)
+
     # Report Metrics
     n = len(answers)
-    logger.info("="*40)
-    logger.info(f"RESULTS (Avg Score 1-5)")
-    logger.info(f"Relevance: {total_metrics['relevance']/n:.2f}")
-    logger.info(f"Faithfulness: {total_metrics['faithfulness']/n:.2f}")
-    logger.info("="*40)
+    logger.info("=" * 60)
+    logger.info("EVALUATION RESULTS")
+    logger.info("=" * 60)
+    logger.info("")
+    logger.info("📊 LLM-as-Judge Metrics (1-5 scale):")
+    logger.info(f"   Relevance:    {total_metrics['llm_relevance']/n:.2f}")
+    logger.info(f"   Faithfulness: {total_metrics['llm_faithfulness']/n:.2f}")
+    logger.info("")
+    logger.info("📝 ROUGE Scores (lexical overlap):")
+    logger.info(f"   ROUGE-1 F1: {total_metrics['rouge1_f']/n:.4f}")
+    logger.info(f"   ROUGE-2 F1: {total_metrics['rouge2_f']/n:.4f}")
+    logger.info(f"   ROUGE-L F1: {total_metrics['rougeL_f']/n:.4f}")
+    logger.info("")
+    logger.info("🔤 BERTScore (semantic similarity):")
+    logger.info(f"   Precision: {total_metrics['bert_precision']/n:.4f}")
+    logger.info(f"   Recall:    {total_metrics['bert_recall']/n:.4f}")
+    logger.info(f"   F1:        {total_metrics['bert_f1']/n:.4f}")
+    logger.info("")
+    logger.info("📈 Answer Quality Metrics:")
+    logger.info(f"   Context Coverage:  {total_metrics['context_coverage']/n:.4f}")
+    logger.info(f"   Question Coverage: {total_metrics['question_coverage']/n:.4f}")
+    logger.info(f"   TF-IDF Similarity: {total_metrics['tfidf_similarity']/n:.4f}")
+    logger.info("=" * 60)
+    logger.info(f"Detailed metrics saved to: metrics_detailed.csv")
 
 if __name__ == "__main__":
     main()

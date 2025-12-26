@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(git -C /c/Ricardo/Master/finance-news log --oneline -10)",
+      "Bash(git -C /c/Ricardo/Master/finance-news branch:*)",
+      "Bash(cat:*)",
+      "Bash(python main.py:*)",
+      "Bash(docker-compose build:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(docker-compose ps:*)",
+      "Bash(docker-compose logs:*)",
+      "Bash(curl:*)",
+      "Bash(ls:*)",
+      "Bash(docker inspect:*)",
+      "Bash(docker exec:*)",
+      "Bash(docker port:*)"
+    ]
+  }
+}

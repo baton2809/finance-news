@@ -1,16 +1,35 @@
 version: '3.8'
 
 services:
-  app:
+  # Web Interface (Streamlit)
+  web:
+    build: .
+    image: finance-rag
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+      - ./cache:/app/cache
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY}
+      - PYTHONUNBUFFERED=1
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # CLI for batch processing
+  cli:
     build: .
     image: finance-rag
     volumes:
       - .:/app
-      # This volume persists the cache so you don't re-embed every time
       - ./cache:/app/cache
     environment:
       - LLM_API_KEY=${LLM_API_KEY}
-      # Use python unbuffered to see logs immediately
       - PYTHONUNBUFFERED=1
-    # Example command (can be overridden)
-    command: python main.py --mode v3 --limit 10
+    command: python main.py --mode v2 --limit 10
+    profiles:
+      - cli
