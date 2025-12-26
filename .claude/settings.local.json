@@ -14,7 +14,9 @@
       "Bash(ls:*)",
       "Bash(docker inspect:*)",
       "Bash(docker exec:*)",
-      "Bash(docker port:*)"
+      "Bash(docker port:*)",
+      "Bash(docker-compose restart:*)",
+      "Bash(docker-compose down:*)"
     ]
   }
 }

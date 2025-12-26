@@ -265,7 +265,7 @@ def render_sidebar():
 
 def render_metrics(metrics: Dict[str, Any]):
     """Render metrics in a nice format"""
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         st.metric(
@@ -283,16 +283,9 @@ def render_metrics(metrics: Dict[str, Any]):
 
     with col3:
         st.metric(
-            "ROUGE-L",
-            f"{metrics.get('rougeL_f', 0):.2f}",
-            help="Лексическое совпадение с контекстом"
-        )
-
-    with col4:
-        st.metric(
             "BERTScore",
             f"{metrics.get('bert_f1', 0):.2f}",
-            help="Семантическое сходство с контекстом"
+            help="Семантическое сходство с контекстом (0.0-1.0)"
         )
 
 

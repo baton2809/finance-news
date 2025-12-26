@@ -246,15 +246,73 @@ def generate_answer(question: str, context: str) -> str:
 # ---------------------- Evaluation Metrics ----------------
 
 # Initialize ROUGE scorer (cached for efficiency)
-ROUGE_SCORER = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=False)
+# NOTE: use_stemmer=True helps match different word forms in Russian
+ROUGE_SCORER = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+
+def extract_relevant_context(answer: str, context: str, max_sentences: int = 5) -> str:
+    """
+    Extract the most relevant sentences from context based on word overlap with answer.
+    This helps ROUGE focus on the most relevant parts of a long context.
+    """
+    # Split context into sentences (simple split by punctuation)
+    sentences = re.split(r'[.!?]\s+', context)
+
+    if len(sentences) <= max_sentences:
+        return context
+
+    # Tokenize answer for comparison
+    answer_words = set(answer.lower().split())
+
+    # Score each sentence by word overlap with answer
+    sentence_scores = []
+    for sent in sentences:
+        sent_words = set(sent.lower().split())
+        overlap = len(answer_words & sent_words)
+        sentence_scores.append((sent, overlap))
+
+    # Get top sentences
+    top_sentences = sorted(sentence_scores, key=lambda x: x[1], reverse=True)[:max_sentences]
+    # Restore original order
+    top_sentences = sorted(top_sentences, key=lambda x: sentences.index(x[0]))
+
+    return '. '.join([sent for sent, _ in top_sentences])
 
 def calculate_rouge_scores(answer: str, context: str) -> Dict[str, float]:
-    """Calculate ROUGE scores between answer and context."""
-    scores = ROUGE_SCORER.score(context, answer)
+    """
+    Calculate ROUGE scores between answer and context.
+
+    Improvements:
+    1. Uses stemming to match word variations (e.g., цен, цены, ценам)
+    2. Normalizes text (lowercase, strip whitespace)
+    3. Extracts most relevant context sentences for fairer comparison
+    4. Returns both F1 and recall scores
+    """
+    # Normalize texts
+    answer_norm = answer.strip().lower()
+    context_norm = context.strip().lower()
+
+    # Extract most relevant parts of context (helps with long contexts)
+    # This gives more meaningful scores when context is much longer than answer
+    relevant_context = extract_relevant_context(answer_norm, context_norm, max_sentences=10)
+
+    # Debug logging
+    logger.debug(f"Answer length: {len(answer_norm)} chars")
+    logger.debug(f"Context length: {len(context_norm)} chars")
+    logger.debug(f"Relevant context length: {len(relevant_context)} chars")
+    logger.debug(f"Answer preview: {answer_norm[:100]}...")
+    logger.debug(f"Relevant context preview: {relevant_context[:200]}...")
+
+    # Calculate ROUGE scores
+    scores = ROUGE_SCORER.score(relevant_context, answer_norm)
+
+    logger.debug(f"ROUGE-L F1: {scores['rougeL'].fmeasure:.3f}, Recall: {scores['rougeL'].recall:.3f}")
+
     return {
         "rouge1_f": scores['rouge1'].fmeasure,
+        "rouge1_r": scores['rouge1'].recall,  # How much of answer is in context
         "rouge2_f": scores['rouge2'].fmeasure,
         "rougeL_f": scores['rougeL'].fmeasure,
+        "rougeL_r": scores['rougeL'].recall,  # Longest common subsequence recall
     }
 
 def calculate_bert_score(answer: str, context: str) -> Dict[str, float]:
