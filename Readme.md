@@ -82,6 +82,14 @@ docker run --rm -v "${PWD}:/app" --env-file .env finance-news --mode v3 --limit 
 - `--mode`: Режим работы (`v1`, `v2`, `v3`)
 - `--limit`: Ограничение количества вопросов для обработки (для тестирования)
 
+python -m venv .venv
+.venv\Scripts\activate
+
+pip install -r requirements.txt
+
+streamlit run app.py
+
+http://localhost:8501
 
 ## 📊 Метрики качества
 
