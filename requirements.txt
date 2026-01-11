@@ -1,0 +1,19 @@
+# Core
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+openai>=1.0.0
+tqdm>=4.65.0
+
+# Embeddings & Vector DB
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.0
+
+# RAGas metrics
+ragas>=0.2.0
+datasets>=2.14.0
+langchain-huggingface>=0.0.1
+langchain-openai>=0.1.0
+
+# Web UI
+streamlit>=1.28.0

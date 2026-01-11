@@ -16,11 +16,14 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-# Additional metrics libraries
-from rouge_score import rouge_scorer
-from bert_score import score as bert_score_fn
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+# RAGas metrics (primary)
+from ragas import evaluate
+from ragas.metrics import faithfulness, context_precision, context_recall, AnswerRelevancy
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from datasets import Dataset
+from langchain_openai import ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
 
 # ---------------------- Logging ----------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -49,7 +52,24 @@ def get_embedding_model():
     global EMBEDDING_MODEL
     if EMBEDDING_MODEL is None:
         logger.info("Loading local embedding model: intfloat/multilingual-e5-small")
-        EMBEDDING_MODEL = SentenceTransformer('intfloat/multilingual-e5-small')
+        try:
+            # Try to load from local cache first (offline mode)
+            EMBEDDING_MODEL = SentenceTransformer('intfloat/multilingual-e5-small', local_files_only=True)
+            logger.info("Loaded model from local cache")
+        except Exception as e:
+            logger.warning(f"Could not load from cache, attempting download: {e}")
+            try:
+                # If cache doesn't exist, download the model
+                EMBEDDING_MODEL = SentenceTransformer('intfloat/multilingual-e5-small')
+                logger.info("Model downloaded successfully")
+            except Exception as download_error:
+                logger.error(f"Failed to download model: {download_error}")
+                raise Exception(
+                    "Cannot load embedding model. Either:\n"
+                    "1. Check your internet connection and DNS settings\n"
+                    "2. Or download the model manually and place it in the cache directory\n"
+                    f"Original error: {download_error}"
+                )
     return EMBEDDING_MODEL
 
 # ---------------------- Clients ----------------------
@@ -245,123 +265,134 @@ def generate_answer(question: str, context: str) -> str:
 
 # ---------------------- Evaluation Metrics ----------------
 
-# Initialize ROUGE scorer (cached for efficiency)
-# NOTE: use_stemmer=True helps match different word forms in Russian
-ROUGE_SCORER = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-
-def extract_relevant_context(answer: str, context: str, max_sentences: int = 5) -> str:
+def evaluate_with_ragas(question: str, answer: str, context: str, reference: str = None) -> Dict[str, float]:
     """
-    Extract the most relevant sentences from context based on word overlap with answer.
-    This helps ROUGE focus on the most relevant parts of a long context.
+    Evaluate answer using RAGas metrics (primary metrics).
+
+    RAGas provides:
+    - faithfulness: Is the answer faithful to the context?
+    - answer_relevancy: Is the answer relevant to the question?
+    - context_precision: How precise is the retrieved context? (requires reference)
+    - context_recall: How much relevant info was retrieved? (requires reference)
+
+    Args:
+        question: The user question
+        answer: The generated answer
+        context: The retrieved context
+        reference: Ground truth answer (optional, enables context_precision & context_recall)
     """
-    # Split context into sentences (simple split by punctuation)
-    sentences = re.split(r'[.!?]\s+', context)
-
-    if len(sentences) <= max_sentences:
-        return context
-
-    # Tokenize answer for comparison
-    answer_words = set(answer.lower().split())
-
-    # Score each sentence by word overlap with answer
-    sentence_scores = []
-    for sent in sentences:
-        sent_words = set(sent.lower().split())
-        overlap = len(answer_words & sent_words)
-        sentence_scores.append((sent, overlap))
-
-    # Get top sentences
-    top_sentences = sorted(sentence_scores, key=lambda x: x[1], reverse=True)[:max_sentences]
-    # Restore original order
-    top_sentences = sorted(top_sentences, key=lambda x: sentences.index(x[0]))
-
-    return '. '.join([sent for sent, _ in top_sentences])
-
-def calculate_rouge_scores(answer: str, context: str) -> Dict[str, float]:
-    """
-    Calculate ROUGE scores between answer and context.
-
-    Improvements:
-    1. Uses stemming to match word variations (e.g., цен, цены, ценам)
-    2. Normalizes text (lowercase, strip whitespace)
-    3. Extracts most relevant context sentences for fairer comparison
-    4. Returns both F1 and recall scores
-    """
-    # Normalize texts
-    answer_norm = answer.strip().lower()
-    context_norm = context.strip().lower()
-
-    # Extract most relevant parts of context (helps with long contexts)
-    # This gives more meaningful scores when context is much longer than answer
-    relevant_context = extract_relevant_context(answer_norm, context_norm, max_sentences=10)
-
-    # Debug logging
-    logger.debug(f"Answer length: {len(answer_norm)} chars")
-    logger.debug(f"Context length: {len(context_norm)} chars")
-    logger.debug(f"Relevant context length: {len(relevant_context)} chars")
-    logger.debug(f"Answer preview: {answer_norm[:100]}...")
-    logger.debug(f"Relevant context preview: {relevant_context[:200]}...")
-
-    # Calculate ROUGE scores
-    scores = ROUGE_SCORER.score(relevant_context, answer_norm)
-
-    logger.debug(f"ROUGE-L F1: {scores['rougeL'].fmeasure:.3f}, Recall: {scores['rougeL'].recall:.3f}")
-
-    return {
-        "rouge1_f": scores['rouge1'].fmeasure,
-        "rouge1_r": scores['rouge1'].recall,  # How much of answer is in context
-        "rouge2_f": scores['rouge2'].fmeasure,
-        "rougeL_f": scores['rougeL'].fmeasure,
-        "rougeL_r": scores['rougeL'].recall,  # Longest common subsequence recall
-    }
-
-def calculate_bert_score(answer: str, context: str) -> Dict[str, float]:
-    """Calculate BERTScore for semantic similarity."""
     try:
-        P, R, F1 = bert_score_fn(
-            [answer], [context],
-            lang="ru",  # Russian language
-            verbose=False,
-            rescale_with_baseline=True
-        )
-        return {
-            "bert_precision": float(P[0]),
-            "bert_recall": float(R[0]),
-            "bert_f1": float(F1[0]),
+        # Split context into individual context chunks (RAGas works better with separated contexts)
+        # The context string contains multiple fragments separated by "---"
+        context_parts = [part.strip() for part in context.split("---") if part.strip()]
+
+        # Clean up context parts - remove score lines and keep only the actual content
+        cleaned_contexts = []
+        for part in context_parts:
+            # Remove "Фрагмент (score: X.XX):" lines
+            lines = part.split("\n")
+            content_lines = [line for line in lines if not line.startswith("Фрагмент (score:")]
+            cleaned_context = "\n".join(content_lines).strip()
+            if cleaned_context:
+                cleaned_contexts.append(cleaned_context)
+
+        # Use cleaned contexts or fallback to original
+        if not cleaned_contexts:
+            cleaned_contexts = [context]
+
+        # Prepare data in RAGas format
+        data = {
+            "user_input": [question],
+            "response": [answer],
+            "retrieved_contexts": [cleaned_contexts],  # List of context chunks
         }
+
+        # Add reference if available
+        if reference:
+            data["reference"] = [reference]
+
+        dataset = Dataset.from_dict(data)
+
+        # Configure LLM: DeepSeek via OpenAI-compatible API
+        # Note: DeepSeek only supports n=1 (no parallel completions)
+        llm = ChatOpenAI(
+            model="deepseek-chat",
+            api_key=os.getenv("LLM_API_KEY"),
+            base_url="https://api.deepseek.com",
+            temperature=0.0,
+            timeout=30,  # Add timeout
+            max_retries=2,  # Add retries
+        )
+        ragas_llm = LangchainLLMWrapper(llm)
+
+        # Configure embeddings: local HuggingFace model
+        embeddings = HuggingFaceEmbeddings(
+            model_name="intfloat/multilingual-e5-small",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True}
+        )
+        ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
+
+        # Select metrics based on whether we have reference
+        # Configure answer_relevancy with strictness=1 to avoid n>1 API calls (DeepSeek doesn't support n>1)
+        answer_relevancy_configured = AnswerRelevancy(strictness=1)
+
+        if reference:
+            # Full evaluation with reference
+            metrics_to_use = [faithfulness, answer_relevancy_configured, context_precision, context_recall]
+            logger.info("Using all RAGas metrics (with reference)")
+        else:
+            # Basic evaluation without reference
+            metrics_to_use = [faithfulness, answer_relevancy_configured]
+            logger.info("Using basic RAGas metrics (no reference)")
+
+        # Run RAGas evaluation with DeepSeek LLM and local embeddings
+        logger.info("Starting RAGas evaluation...")
+        result = evaluate(
+            dataset,
+            metrics=metrics_to_use,
+            llm=ragas_llm,
+            embeddings=ragas_embeddings,
+        )
+
+        # Build results dictionary
+        # Handle both scalar and list returns from RAGAS (different versions return different formats)
+        def extract_metric(value):
+            """Extract float from RAGAS metric (handles both list and scalar formats)"""
+            if isinstance(value, list):
+                return float(value[0]) if len(value) > 0 else 0.0
+            return float(value)
+
+        results = {
+            "ragas_faithfulness": extract_metric(result["faithfulness"]),
+            "ragas_answer_relevancy": extract_metric(result["answer_relevancy"]),
+            "ragas_error": None,  # No error
+        }
+
+        # Add context metrics if available
+        if reference:
+            results["ragas_context_precision"] = extract_metric(result["context_precision"])
+            results["ragas_context_recall"] = extract_metric(result["context_recall"])
+
+        logger.info(f"✅ RAGas evaluation successful: faithfulness={results['ragas_faithfulness']:.3f}, relevancy={results['ragas_answer_relevancy']:.3f}")
+        return results
+
     except Exception as e:
-        logger.warning(f"BERTScore calculation failed: {e}")
-        return {"bert_precision": 0.0, "bert_recall": 0.0, "bert_f1": 0.0}
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logger.error(f"❌ RAGas evaluation failed: {error_msg}")
+        import traceback
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
 
-def calculate_answer_quality(question: str, answer: str, context: str) -> Dict[str, float]:
-    """Calculate lexical and structural quality metrics."""
-    # Answer length metrics
-    answer_words = len(answer.split())
-    context_words = len(context.split())
-
-    # Context coverage (how much of context keywords appear in answer)
-    context_tokens = set(context.lower().split())
-    answer_tokens = set(answer.lower().split())
-    coverage = len(context_tokens & answer_tokens) / max(len(context_tokens), 1)
-
-    # Question keyword overlap
-    question_tokens = set(question.lower().split())
-    question_coverage = len(question_tokens & answer_tokens) / max(len(question_tokens), 1)
-
-    # TF-IDF similarity between answer and context
-    try:
-        vectorizer = TfidfVectorizer()
-        tfidf_matrix = vectorizer.fit_transform([context, answer])
-        tfidf_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
-    except:
-        tfidf_sim = 0.0
-
-    return {
-        "answer_length": answer_words,
-        "context_coverage": coverage,
-        "question_coverage": question_coverage,
-        "tfidf_similarity": tfidf_sim,
-    }
+        # Return error info instead of just zeros
+        base_results = {
+            "ragas_faithfulness": 0.0,
+            "ragas_answer_relevancy": 0.0,
+            "ragas_error": error_msg,  # Store error message
+        }
+        if reference:
+            base_results["ragas_context_precision"] = 0.0
+            base_results["ragas_context_recall"] = 0.0
+        return base_results
 
 def evaluate_answer_llm(question: str, answer: str, context: str) -> Dict[str, int]:
     """
@@ -400,58 +431,63 @@ def evaluate_answer_llm(question: str, answer: str, context: str) -> Dict[str, i
     except:
         return {"llm_relevance": 0, "llm_faithfulness": 0}
 
-def evaluate_answer(question: str, answer: str, context: str) -> Dict[str, float]:
+def evaluate_answer(question: str, answer: str, context: str, reference: str = None) -> Dict[str, float]:
     """
-    Comprehensive evaluation combining multiple metrics:
-    - LLM-as-Judge (relevance, faithfulness)
-    - ROUGE scores (lexical overlap)
-    - BERTScore (semantic similarity)
-    - Answer quality metrics (coverage, length, TF-IDF)
+    Comprehensive evaluation combining:
+    - RAGas metrics (PRIMARY): faithfulness, answer_relevancy, [context_precision, context_recall if reference available]
+    - LLM-as-Judge (SECONDARY): relevance, faithfulness (1-5 scale)
+
+    Args:
+        question: The user question
+        answer: The generated answer
+        context: The retrieved context
+        reference: Ground truth answer (optional, enables additional metrics)
     """
     metrics = {}
 
-    # 1. LLM-as-Judge (subjective but comprehensive)
+    # 1. RAGas metrics (PRIMARY)
+    ragas_metrics = evaluate_with_ragas(question, answer, context, reference)
+    metrics.update(ragas_metrics)
+
+    # 2. LLM-as-Judge (SECONDARY)
     llm_metrics = evaluate_answer_llm(question, answer, context)
     metrics.update(llm_metrics)
-
-    # 2. ROUGE scores (lexical overlap with context)
-    rouge_metrics = calculate_rouge_scores(answer, context)
-    metrics.update(rouge_metrics)
-
-    # 3. BERTScore (semantic similarity)
-    bert_metrics = calculate_bert_score(answer, context)
-    metrics.update(bert_metrics)
-
-    # 4. Answer quality metrics
-    quality_metrics = calculate_answer_quality(question, answer, context)
-    metrics.update(quality_metrics)
-
-    # Legacy compatibility: keep 'relevance' and 'faithfulness' for backward compat
-    metrics["relevance"] = metrics["llm_relevance"]
-    metrics["faithfulness"] = metrics["llm_faithfulness"]
 
     return metrics
 
 # ---------------------- Pipelines --------------------
-def run_rag(mode: str, question: str, df: pd.DataFrame, index: faiss.Index, metadata: List[Any], top_k: int, final_k: int) -> Tuple[str, Dict]:
+def run_rag(mode: str, question: str, df: pd.DataFrame, index: faiss.Index, metadata: List[Any], top_k: int, final_k: int, reference: str = None) -> Tuple[str, Dict]:
+    """
+    Run RAG pipeline with evaluation.
+
+    Args:
+        mode: RAG mode (v1, v2, v3)
+        question: User question
+        df: Knowledge base dataframe
+        index: FAISS index
+        metadata: FAISS metadata
+        top_k: Number of candidates to retrieve
+        final_k: Number of final contexts to use
+        reference: Ground truth answer (optional, for enhanced metrics)
+    """
     # 1. Retrieve
     hits = retrieve_faiss(question, index, metadata, top_k)
-    
+
     # 2. Rerank (if v3)
     if mode == "v3":
         hits = llm_rerank(question, hits, df, final_k)
     else:
         hits = hits[:final_k]
-        
+
     # 3. Context
     ctx = build_context(hits, df)
-    
+
     # 4. Generate
     ans = generate_answer(question, ctx)
-    
-    # 5. Evaluate (Metric)
-    metrics = evaluate_answer(question, ans, ctx)
-    
+
+    # 5. Evaluate (Metric) - pass reference if available
+    metrics = evaluate_answer(question, ans, ctx, reference)
+
     return ans, metrics
 
 # ---------------------- Main -------------------------
@@ -461,8 +497,6 @@ def main():
                         help="RAG mode: v1=doc-level, v2=chunk, v3=chunk+rerank")
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit number of questions to process")
-    parser.add_argument("--skip-bert", action="store_true",
-                        help="Skip BERTScore calculation (faster)")
     args = parser.parse_args()
 
     # Config based on mode
@@ -479,26 +513,46 @@ def main():
 
     index, metadata = build_faiss_index(df, index_file, meta_file, mode=index_mode)
 
-    # Load Questions
-    questions_df = pd.read_csv("./questions.csv")
+    # Load Questions (try with references first, fallback to basic questions)
+    references_file = "./questions_with_references.csv"
+    use_references = False
+
+    if os.path.exists(references_file):
+        logger.info(f"Loading questions with references from {references_file}")
+        questions_df = pd.read_csv(references_file)
+        use_references = True
+        logger.info("✅ References available - will use context_precision and context_recall")
+    else:
+        logger.info("Loading questions from ./questions.csv (no references)")
+        questions_df = pd.read_csv("./questions.csv")
+        logger.info("⚠️  No references available - using basic metrics only")
+
     questions = questions_df["Вопрос"].tolist()
+    references = questions_df["Референсный ответ"].tolist() if use_references else [None] * len(questions)
+
     if args.limit:
         questions = questions[:args.limit]
+        references = references[:args.limit]
 
     answers = []
     all_metrics = []
 
     # Initialize accumulators for all metrics
     metric_keys = [
+        # RAGas metrics (PRIMARY)
+        "ragas_faithfulness", "ragas_answer_relevancy",
+        # LLM-as-Judge (SECONDARY)
         "llm_relevance", "llm_faithfulness",
-        "rouge1_f", "rouge2_f", "rougeL_f",
-        "bert_precision", "bert_recall", "bert_f1",
-        "context_coverage", "question_coverage", "tfidf_similarity"
     ]
+
+    # Add context metrics if using references
+    if use_references:
+        metric_keys.extend(["ragas_context_precision", "ragas_context_recall"])
+
     total_metrics = {k: 0.0 for k in metric_keys}
 
-    for q in tqdm(questions, desc="RAG Pipeline"):
-        ans, metrics = run_rag(args.mode, q, df, index, metadata, top_k, final_k)
+    for q, ref in tqdm(zip(questions, references), total=len(questions), desc="RAG Pipeline"):
+        ans, metrics = run_rag(args.mode, q, df, index, metadata, top_k, final_k, reference=ref)
         answers.append(ans)
         all_metrics.append(metrics)
 
@@ -521,24 +575,19 @@ def main():
     logger.info("EVALUATION RESULTS")
     logger.info("=" * 60)
     logger.info("")
-    logger.info("📊 LLM-as-Judge Metrics (1-5 scale):")
+    logger.info("PRIMARY METRICS - RAGas (0-1 scale):")
+    logger.info(f"   Faithfulness:       {total_metrics['ragas_faithfulness']/n:.4f}")
+    logger.info(f"   Answer Relevancy:   {total_metrics['ragas_answer_relevancy']/n:.4f}")
+
+    # Show context metrics if available
+    if use_references:
+        logger.info(f"   Context Precision:  {total_metrics['ragas_context_precision']/n:.4f}")
+        logger.info(f"   Context Recall:     {total_metrics['ragas_context_recall']/n:.4f}")
+
+    logger.info("")
+    logger.info("SECONDARY METRICS - LLM-as-Judge (1-5 scale):")
     logger.info(f"   Relevance:    {total_metrics['llm_relevance']/n:.2f}")
     logger.info(f"   Faithfulness: {total_metrics['llm_faithfulness']/n:.2f}")
-    logger.info("")
-    logger.info("📝 ROUGE Scores (lexical overlap):")
-    logger.info(f"   ROUGE-1 F1: {total_metrics['rouge1_f']/n:.4f}")
-    logger.info(f"   ROUGE-2 F1: {total_metrics['rouge2_f']/n:.4f}")
-    logger.info(f"   ROUGE-L F1: {total_metrics['rougeL_f']/n:.4f}")
-    logger.info("")
-    logger.info("🔤 BERTScore (semantic similarity):")
-    logger.info(f"   Precision: {total_metrics['bert_precision']/n:.4f}")
-    logger.info(f"   Recall:    {total_metrics['bert_recall']/n:.4f}")
-    logger.info(f"   F1:        {total_metrics['bert_f1']/n:.4f}")
-    logger.info("")
-    logger.info("📈 Answer Quality Metrics:")
-    logger.info(f"   Context Coverage:  {total_metrics['context_coverage']/n:.4f}")
-    logger.info(f"   Question Coverage: {total_metrics['question_coverage']/n:.4f}")
-    logger.info(f"   TF-IDF Similarity: {total_metrics['tfidf_similarity']/n:.4f}")
     logger.info("=" * 60)
     logger.info(f"Detailed metrics saved to: metrics_detailed.csv")
 

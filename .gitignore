@@ -14,7 +14,8 @@ venv/
 *.pkl
 *.xlsx
 *.tsv
-*.txt
+# Note: requirements.txt is explicitly tracked
+!requirements.txt
 
 # Local files and tests
 *.local

@@ -1,35 +1,74 @@
 version: '3.8'
 
 services:
-  # Web Interface (Streamlit)
+  # NGINX - Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: finance-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - web
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - finance-network
+
+  # WEB - Streamlit Application
   web:
     build: .
     image: finance-rag
-    ports:
-      - "8501:8501"
+    container_name: finance-web
+    expose:
+      - "8501"
     volumes:
       - .:/app
       - ./cache:/app/cache
+      - model_cache:/root/.cache
     environment:
       - LLM_API_KEY=${LLM_API_KEY}
       - PYTHONUNBUFFERED=1
-    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+    command: streamlit run app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s
       timeout: 10s
       retries: 3
+    networks:
+      - finance-network
 
-  # CLI for batch processing
+  # CLI - Batch Processing
   cli:
     build: .
     image: finance-rag
+    container_name: finance-cli
     volumes:
       - .:/app
       - ./cache:/app/cache
+      - model_cache:/root/.cache
     environment:
       - LLM_API_KEY=${LLM_API_KEY}
       - PYTHONUNBUFFERED=1
     command: python main.py --mode v2 --limit 10
     profiles:
       - cli
+    networks:
+      - finance-network
+
+volumes:
+  nginx_logs:
+    driver: local
+  model_cache:
+    driver: local
+
+networks:
+  finance-network:
+    driver: bridge

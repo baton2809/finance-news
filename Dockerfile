@@ -5,6 +5,7 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps
@@ -14,9 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # PRE-DOWNLOAD THE EMBEDDING MODEL (Caches it inside the image)
 # Using multilingual-e5-small for faster Russian language support
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('intfloat/multilingual-e5-small')"
-
-# Pre-download BERTScore model for Russian
-RUN python -c "from bert_score import score; score(['test'], ['test'], lang='ru', verbose=False)"
 
 # Copy code
 COPY . .
