@@ -250,7 +250,8 @@ def generate_answer(question: str, context: str) -> str:
     client = get_llm_client()
     prompt = (
         "Ответь на вопрос, используя контекст.\n"
-        "Если информации нет, скажи 'В контексте нет информации'.\n\n"
+        "Если информации нет, скажи 'В контексте нет информации'.\n"
+        "ВАЖНО: Всегда выделяй **жирным** ключевые термины, цифры и важные понятия в ответе.\n\n"
         f"КОНТЕКСТ:\n{context}\n\n"
         f"ВОПРОС: {question}"
     )
@@ -320,8 +321,8 @@ def evaluate_with_ragas(question: str, answer: str, context: str, reference: str
             api_key=os.getenv("LLM_API_KEY"),
             base_url="https://api.deepseek.com",
             temperature=0.0,
-            timeout=30,  # Add timeout
-            max_retries=2,  # Add retries
+            timeout=60,  # Increased timeout for complex evaluations
+            max_retries=3,  # More retries for reliability
         )
         ragas_llm = LangchainLLMWrapper(llm)
 

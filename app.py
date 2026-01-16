@@ -789,18 +789,23 @@ def main():
 
     # Process query
     if submit_btn and question:
-        with st.spinner(""):
-            st.markdown('<div class="loading-pulse" style="text-align: center; padding: 2rem;">Обработка вашего вопроса...</div>', unsafe_allow_html=True)
-            result = run_query(
-                question=question,
-                mode=mode,
-                df=st.session_state.df,
-                index=st.session_state.index,
-                metadata=st.session_state.metadata,
-                references_dict=st.session_state.references_dict,
-                top_k=top_k,
-                final_k=final_k
-            )
+        # Create a placeholder for loading message that can be cleared
+        loading_placeholder = st.empty()
+        loading_placeholder.markdown('<div class="loading-pulse" style="text-align: center; padding: 2rem;">Обработка вашего вопроса...</div>', unsafe_allow_html=True)
+
+        result = run_query(
+            question=question,
+            mode=mode,
+            df=st.session_state.df,
+            index=st.session_state.index,
+            metadata=st.session_state.metadata,
+            references_dict=st.session_state.references_dict,
+            top_k=top_k,
+            final_k=final_k
+        )
+
+        # Clear the loading message after query completes
+        loading_placeholder.empty()
 
         if result["error"]:
             st.markdown(f'<div class="status-badge error" style="padding: 1rem; width: 100%;">{result["error"]}</div>', unsafe_allow_html=True)
@@ -811,11 +816,25 @@ def main():
                 ref_badge = ' <span style="background: #fbbf24; color: #78350f; padding: 0.25rem 0.5rem; border-radius: 6px; font-size: 0.75rem; margin-left: 0.5rem;">✨ С референсом - все 4 RAGAS метрики</span>'
             st.markdown(f'<div class="status-badge success" style="margin-bottom: 1rem;">Ответ сгенерирован за {result["time"]:.2f} секунд{ref_badge}</div>', unsafe_allow_html=True)
 
-            # Answer
+            # Show the question before the answer
+            st.markdown(f"""
+                <div style="background: #f0f4ff; border-left: 4px solid #4f46e5; border-radius: 0 12px 12px 0; padding: 1rem 1.5rem; margin-bottom: 1rem;">
+                    <div style="color: #4f46e5; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.5rem;">Ваш вопрос</div>
+                    <div style="color: #1a1a2e; font-size: 1.05rem;">{question}</div>
+                </div>
+            """, unsafe_allow_html=True)
+
+            # Answer - convert markdown bold to HTML bold for proper rendering
+            answer_html = result["answer"].replace("**", "<strong>", 1)
+            while "**" in answer_html:
+                answer_html = answer_html.replace("**", "</strong>", 1)
+                if "**" in answer_html:
+                    answer_html = answer_html.replace("**", "<strong>", 1)
+
             st.markdown(f"""
                 <div class="answer-container">
                     <div class="answer-label">Ответ ИИ</div>
-                    <div class="answer-text">{result["answer"]}</div>
+                    <div class="answer-text">{answer_html}</div>
                 </div>
             """, unsafe_allow_html=True)
 
